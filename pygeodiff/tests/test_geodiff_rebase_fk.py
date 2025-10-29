@@ -88,16 +88,16 @@ def test_geodiff_rebase_fk_happy_path(fk_constrained, user_a_data_first, tmp_pat
     geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
     # Assert that rebased database contains expected changes
-    with sqlite3.connect(mine) as conn:
-        assert_names("parent", expected_parents, conn)
-        assert_names("child", expected_children, conn)
+    assert_names("parent", expected_parents, mine)
+    assert_names("child", expected_children, mine)
 
 
-def assert_names(table: str, expected_names: set[str], conn: sqlite3.Connection) -> bool:
-    names = set(
-        row[0] for row in
-        conn.execute(f"SELECT name FROM {table}").fetchall()
-    )
+def assert_names(table: str, expected_names: set[str], db: Path) -> bool:
+    with sqlite3.connect(db) as conn:
+        names = set(
+            row[0] for row in
+            conn.execute(f"SELECT name FROM {table}").fetchall()
+        )
     assert names == expected_names
 
 
