@@ -7,16 +7,29 @@ from typing import Tuple
 import pytest
 
 import pygeodiff
+from pygeodiff import GeoDiffLibError
 
 GEODIFFLIB = os.environ.get("GEODIFFLIB", None)
 
 
 @pytest.mark.parametrize(
-    'user_a_data_first',
-    [True, False],
-    ids=['user_a_data_first', 'user_b_data_first']
+    "fk_constrained",
+    [
+        pytest.param(False, id="no_fk_constraint"),
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                raises=GeoDiffLibError,
+                reason="Expected to fail due to issue 210, when this xpasses remove this decorator",
+            ),
+            id="fkconstraint",
+        ),
+    ],
 )
-def test_geodiff_rebase_fk_happy_path(user_a_data_first, tmp_path):
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_fk_happy_path(fk_constrained, user_a_data_first, tmp_path):
     """
     This test checks that rebase succeeds on simple changes on tables with
     foreign key constraints.  This test applies INSERT, UPDATE and DELETE
@@ -25,7 +38,7 @@ def test_geodiff_rebase_fk_happy_path(user_a_data_first, tmp_path):
     # Arrange
     geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
     conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(tmp_path, constrained=False)
+    original, user_a, user_b = create_gpkg_files(tmp_path, fk_constrained=False)
 
     # Apply changes to databases to give the following expected values
     expected_parents = set(['p1_updated', 'p2', 'p3', 'p4'])  # One edited, two added
@@ -74,7 +87,7 @@ def test_geodiff_rebase_fk_happy_path(user_a_data_first, tmp_path):
     # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
     geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Assert that rebased database contains changes
+    # Assert that rebased database contains expected changes
     with sqlite3.connect(mine) as conn:
         assert_names("parent", expected_parents, conn)
         assert_names("child", expected_children, conn)
@@ -88,7 +101,7 @@ def assert_names(table: str, expected_names: set[str], conn: sqlite3.Connection)
     assert names == expected_names
 
 
-def create_gpkg_files(tmp_path: Path, constrained: bool = True) -> Tuple[Path, Path, Path]:
+def create_gpkg_files(tmp_path: Path, fk_constrained: bool = True) -> Tuple[Path, Path, Path]:
     """
     Create 3 GeoPackage files at the given filepaths, create the
     same tables with the same original data: two parents, each with
@@ -114,11 +127,11 @@ def create_gpkg_files(tmp_path: Path, constrained: bool = True) -> Tuple[Path, P
             FOREIGN KEY("parent_uuid") REFERENCES "parent"("uuid")
         )"""
 
-    if not constrained:
+    if not fk_constrained:
         # Remove database constraints from table definitions
         create_parent_sql = re.sub(r" UNIQUE", "", create_parent_sql)
         create_child_sql = re.sub(r" UNIQUE", "", create_child_sql)
-        create_child_sql = re.sub(r",.*FOREIGN.*REFERENCES.*\)", "", create_child_sql, re.DOTALL)
+        create_child_sql = re.sub(r",.*FOREIGN.*REFERENCES.*\)", "", create_child_sql)
 
     # Define test data
     parent_data = [
