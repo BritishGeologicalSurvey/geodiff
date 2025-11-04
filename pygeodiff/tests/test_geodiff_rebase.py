@@ -1,392 +1,572 @@
 """
-This module adds tests that address the issue in: https://github.com/MerginMaps/geodiff/issues/210
+This module tests the behaviour of geodiff when there are database-level constraints
+applied to the tables.
 
-The tests cover the rebase functionality when called via Python.  When the underlying
-database has a UNIQUE constraint, the geodiff library will fail.  The test suite describes
-the expected behaviour for once the issue has been resolved.  It uses parameterisation
-to cover scenarios when the UNIQUE constraint is and isn't present and when the databases
-are passed in different orders.
+Where tests are parametrised with `db_constrained`, the same test is run with and
+without the db constraints.  Tests against unconstrained databases act as
+regression tests for existing geodiff behaviour.  Tests are parametrised with
+`user_a_data_first` to show where rebase outcome depends on the order that
+database files are passed to the rebase function.
 
-Four of the tests have been marked with 'xfail'.  These fail now, but should pass once
-the issue with UNIQUE constraints has been resolved.  The other tests are
-included to prevent regressions.
+Some of the tests are expected to fail until issue 210 has been resolved.
+https://github.com/MerginMaps/geodiff/issues/210
 
-The expected test output is as follows:
+Once database constraint handling has been implemented, the tests will pass and
+the `xfail` decorators can be removed.
 
-
-$ pytest pygeodiff/tests -vk geodiff_rebase
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_unique_constraint_violation[user_a_data_first] XFAIL [  5%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_unique_constraint_violation[user_b_data_first] XFAIL [ 11%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_insert[user_a_data_first-no_constraint] PASSED [ 16%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_insert[user_a_data_first-unique_constraint] XFAIL [ 22%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_insert[user_b_data_first-no_constraint] PASSED [ 27%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_insert[user_b_data_first-unique_constraint] XFAIL [ 33%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_update[user_a_data_first-no_constraint] PASSED [ 38%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_update[user_a_data_first-unique_constraint] PASSED [ 44%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_update[user_b_data_first-no_constraint] PASSED [ 50%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_update[user_b_data_first-unique_constraint] PASSED [ 55%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_same_item_update[user_a_data_first-no_constraint] PASSED [ 61%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_same_item_update[user_a_data_first-unique_constraint] PASSED [ 66%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_same_item_update[user_b_data_first-no_constraint] PASSED [ 72%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_no_conflict_same_item_update[user_b_data_first-unique_constraint] PASSED [ 77%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_resolved_conflict_update[user_a_data_first-no_constraint] PASSED [ 83%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_resolved_conflict_update[user_a_data_first-unique_constraint] PASSED [ 88%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_resolved_conflict_update[user_b_data_first-no_constraint] PASSED [ 94%]
-pygeodiff/tests/test_geodiff_rebase.py::test_geodiff_rebase_resolved_conflict_update[user_b_data_first-unique_constraint] PASSED [100%]
-
-Once the UNIQUE constraint issue is resolved, the 'xfail' tests should pass
-with the label 'XPASS'.  At this point, the xfail configuration can be removed
-(see instructions on each test).
+The behaviour of GeoDiff in scenarios where combining changes from two users will
+cause a database constraint to fail is as-yet undefined.  Perhaps it should raise
+a GeoDiffConstraintError that reports the error message from the database with
+information about the constraint that was broken.
 """
 
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
-from typing import List, Tuple
+from typing import Tuple
 
 import pytest
 
 import pygeodiff
-from pygeodiff.geodifflib import GeoDiffLibConflictError, GeoDiffLibError
+from pygeodiff import GeoDiffLibError
 
 GEODIFFLIB = os.environ.get("GEODIFFLIB", None)
 
-CREATE_TABLE = """
-    CREATE TABLE trees (
-        "fid" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-        "species" TEXT,
-        "age" INTEGER,
-        "user_id" TEXT UNIQUE
-    )
+"""
+These tests cover simple rebase scenarios, with or without database constraints
+applied.
+
+All should pass once issue 210 has been resolved.
 """
 
-ORIGINAL_DATA = [
-    {"species": "Maple", "age": 25, "user_id": "original_001"},
-    {"species": "Oak", "age": 30, "user_id": "original_002"},
-    {"species": "Pine", "age": 18, "user_id": "original_003"},
-]
 
-
-# Once the tests are XPASSing, the xfail decorator should be removed
-@pytest.mark.xfail(
-    raises=GeoDiffLibError,
-    reason="Expected to fail due to issue 210, when this xpasses remove this decorator")
 @pytest.mark.parametrize(
-    'user_a_data_first',
-    [True, False],
-    ids=['user_a_data_first', 'user_b_data_first']
-)
-def test_geodiff_rebase_unique_constraint_violation(user_a_data_first, tmp_path):
-    """
-    This test also exemplifies issue 210, but with a genuine UNIQUE constraint violation.
-
-    This is a real potential use case where a row is added by the same user on two different
-    devices without locally synchronising the first addition before making the second.
-
-    With the UNIQUE constraint on the `user_id` column, a conflict should be reported
-    with sufficient information for the conflict to be resolved manually. However,
-    this currently fails for the reason outlined in the issue.
-
-    This test doesn't parameterise create_table_ddl because the situation only
-    arises when the UNIQUE constraint exists.
-    """
-    # Arrange
-    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
-    conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(CREATE_TABLE, tmp_path)
-    # Add rows with conflicting UNIQUE values
-    with sqlite3.connect(user_a) as conn_a, sqlite3.connect(user_b) as conn_b:
-        conn_a.execute("INSERT INTO trees VALUES (null, 'Fir', 12, 'user_x_001')")
-        conn_b.execute("INSERT INTO trees VALUES (null, 'Elm', 22, 'user_x_001')")
-
-    # Set the argument order, i.e. which gpkg should be the rebased result
-    if user_a_data_first:
-        older, newer = user_a, user_b
-    else:
-        older, newer = user_b, user_a
-
-    # A unresolved conflict implies the newer value not have changed
-    # and so the result will be the same as the original
-    with sqlite3.connect(newer) as conn:
-        cursor = conn.cursor()
-        expected = cursor.execute("SELECT species, age, user_id FROM trees").fetchall()
-
-    # Act & Assert
-    try:
-        geodiff.rebase(str(original), str(older), str(newer), str(conflict))
-    except GeoDiffLibConflictError:
-        # Should this error be raised here?
-        # If so, then gpkg should contain no changes
-        assert_gpkg(newer, expected)
-        # Should a conflict file be created?
-        assert conflict.exists()
-        conflict_json = json.loads(conflict.read_text())
-        assert conflict_json['geodiff'][0]['type'] == 'conflict'
-        # What other information should it contain?
-    except GeoDiffLibError as excinfo:
-        # UNIQUE constraint on the user_id column causes geodiff.rebase to fail
-        assert excinfo.args[0] == 'rebase'
-        raise excinfo
-
-
-# Once the tests are XPASSing, the xfail decorator should be replaced with:
-#
-# @pytest.mark.parametrize('create_table_ddl', [
-#     pytest.param(CREATE_TABLE.replace(' UNIQUE', ''), id='no_constraint'),
-#     pytest.param(CREATE_TABLE, id='unique_constraint')
-# ])
-@pytest.mark.parametrize(
-    "create_table_ddl",
+    "db_constrained",
     [
-        pytest.param(CREATE_TABLE.replace(" UNIQUE", ""), id="no_constraint"),
+        pytest.param(False, id="no_db_constraint"),
         pytest.param(
-            CREATE_TABLE,
+            True,
             marks=pytest.mark.xfail(
                 raises=GeoDiffLibError,
                 reason="Expected to fail due to issue 210, when this xpasses remove this decorator",
             ),
-            id="unique_constraint",
+            id="dbconstraint",
         ),
     ],
 )
 @pytest.mark.parametrize(
-    "user_a_data_first",
-    [True, False],
-    ids=["user_a_data_first", "user_b_data_first"]
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
 )
-def test_geodiff_rebase_no_conflict_insert(
-    create_table_ddl, user_a_data_first, tmp_path
-):
+def test_geodiff_rebase_happy_path_single_table(db_constrained, user_a_data_first, tmp_path):
     """
-    This test exemplifies issue 210. With the UNIQUE constraint on the `user_id` column,
-    the data should be able to be rebased as there are no conflicting values, but this
-    currently fails for the reason outlined in the issue.
-
-    Without the UNIQUE constraint the rebase takes place as expected, with no conflicts
-    to be resolved.
+    This test checks that rebase succeeds on changes to a single table with
+    or without unique constraints.  This test applies INSERT, UPDATE and DELETE
+    changes that should not produce any conflicts.
     """
     # Arrange
     geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
     conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(create_table_ddl, tmp_path)
-    # Insert a new row in each user data table
-    with sqlite3.connect(user_a) as conn_a, sqlite3.connect(user_b) as conn_b:
-        conn_a.execute("INSERT INTO trees VALUES (null, 'Fir', 12, 'user_a_001')")
-        conn_b.execute("INSERT INTO trees VALUES (null, 'Elm', 22, 'user_b_001')")
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=db_constrained)
 
-    # Set the argument order, i.e. which gpkg should be the rebased result
-    if user_a_data_first:
-        older, newer = user_a, user_b
-    else:
-        older, newer = user_b, user_a
+    # Apply changes to databases to give the following expected values
+    expected = {
+        "species": [
+            {"species_id": "MPL", "name": "Maple_updated"},  # updated
+            {"species_id": "OAK", "name": "Oak_updated"},  # updated
+            # 'PIN' deleted
+            {"species_id": "SPC", "name": "Spruce"},  # inserted
+            {"species_id": "BCH", "name": "Birch"},  # inserted
+        ],
+    }
 
-    # The expected data following a successful rebase
-    expected = [
-        ("Maple", 25, "original_001"),
-        ("Oak", 30, "original_002"),
-        ("Pine", 18, "original_003"),
-        ("Elm", 22, "user_b_001"),  # Added row from user_b
-        ("Fir", 12, "user_a_001"),  # Added row from user_a
-    ]
-
-    # Act & Assert
-    try:
-        geodiff.rebase(str(original), str(older), str(newer), str(conflict))
-        # The rebased gpkg should contain all changes and no conflict file should be created
-        assert_gpkg(newer, expected)
-        assert not conflict.exists()
-    except GeoDiffLibConflictError:
-        # This error subclass SHOULD NOT be raised here as there is no conflict
-        pytest.fail("Incorrect exception raised")
-    except GeoDiffLibError as excinfo:
-        # UNIQUE constraint on the user_id column causes geodiff.rebase to fail
-        assert excinfo.args[0] == 'rebase'
-        raise excinfo
-
-
-@pytest.mark.parametrize(
-    "create_table_ddl",
-    [
-        pytest.param(CREATE_TABLE.replace(" UNIQUE", ""), id="no_constraint"),
-        pytest.param(CREATE_TABLE, id="unique_constraint"),
-    ],
-)
-@pytest.mark.parametrize(
-    "user_a_data_first",
-    [True, False],
-    ids=["user_a_data_first", "user_b_data_first"]
-)
-def test_geodiff_rebase_no_conflict_update(create_table_ddl, user_a_data_first, tmp_path):
-    """
-    This test for a case with no conflict. user_a and user_b update the
-    different columns and rows. pygeodiff rebases using the both values
-    and no conflict file is created.
-
-    This should be unnaffected by any changes made to resolve issue 210.
-    """
-    # Arrange
-    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
-    conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(create_table_ddl, tmp_path)
-    # Update a value in each user data table
-    with sqlite3.connect(user_a) as conn_a, sqlite3.connect(user_b) as conn_b:
+    with sqlite3.connect(user_a) as conn_a:
         conn_a.execute(
-            "UPDATE trees SET species = 'Pine' WHERE user_id = 'original_001'"
+            """
+            UPDATE species SET name='Maple_updated' WHERE species_id='MPL'
+            """
         )
-        conn_b.execute("UPDATE trees SET age = 35 WHERE user_id = 'original_002'")
+        conn_a.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Birch'
+            )
+            """
+        )
 
-    # Set the argument order, i.e. which gpkg should be the rebased result
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            UPDATE species SET name='Oak_updated' WHERE species_id='OAK'
+            """
+        )
+        conn_b.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'SPC', 'Spruce'
+            )
+            """
+        )
+        conn_b.execute(
+            """
+            DELETE FROM species WHERE species_id IS 'PIN'
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
-        older, newer = user_a, user_b
+        theirs, mine = user_a, user_b
     else:
-        older, newer = user_b, user_a
+        theirs, mine = user_b, user_a
 
-    expected = [
-        ("Pine", 25, "original_001"),  # Updated species from user_a
-        ("Oak", 35, "original_002"),  # Updated age from user_b
-        ("Pine", 18, "original_003"),
-    ]
+    # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Act & Assert
-    geodiff.rebase(str(original), str(older), str(newer), str(conflict))
-    # The rebased gpkg should contain all changes and no conflict file should be created
-    assert_gpkg(newer, expected)
+    # Assert that rebased database contains expected changes and no conflict exists
+    assert_data_as_expected(mine, expected)
     assert not conflict.exists()
 
 
 @pytest.mark.parametrize(
-    "create_table_ddl",
+    "db_constrained",
     [
-        pytest.param(CREATE_TABLE.replace(" UNIQUE", ""), id="no_constraint"),
-        pytest.param(CREATE_TABLE, id="unique_constraint"),
+        pytest.param(False, id="no_db_constraint"),
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                raises=GeoDiffLibError,
+                reason="Expected to fail due to issue 210, when this xpasses remove this decorator",
+            ),
+            id="dbconstraint",
+        ),
     ],
 )
 @pytest.mark.parametrize(
-    "user_a_data_first",
-    [True, False],
-    ids=["user_a_data_first", "user_b_data_first"]
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
 )
-def test_geodiff_rebase_no_conflict_same_item_update(create_table_ddl, user_a_data_first, tmp_path):
+def test_geodiff_rebase_happy_path_fk_tables(db_constrained, user_a_data_first, tmp_path):
     """
-    This test is related to issue 210, but with a row in a column with the UNIQUE constraint
-    being changed to the same value by both users.
-
-    This should be unnaffected by any changes made to resolve issue 210.
+    This test checks that rebase succeeds on changes on multiple tables related
+    by a foreign key constraint.  This test applies INSERT, UPDATE and DELETE
+    changes that should not produce any conflicts.
     """
     # Arrange
     geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
     conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(create_table_ddl, tmp_path)
-    # Update a row with identical UNIQUE values
-    with sqlite3.connect(user_a) as conn_a, sqlite3.connect(user_b) as conn_b:
-        conn_a.execute("UPDATE trees SET user_id = 'user_x_001' WHERE user_id = 'original_002'")
-        conn_b.execute("UPDATE trees SET user_id = 'user_x_001' WHERE user_id = 'original_002'")
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=db_constrained)
 
-    # Set the argument order, i.e. which gpkg should be the rebased result
+    # Apply changes to databases to give the following expected values
+    expected = {
+        "species": [
+            {"species_id": "MPL", "name": "Maple"},
+            {"species_id": "OAK", "name": "Oak"},
+            # 'PIN' deleted
+            {"species_id": "SPC", "name": "Spruce"},  # inserted
+            {"species_id": "BCH", "name": "Birch"},  # inserted
+        ],
+        "trees": [
+            {"tree_id": 20251103001, "species_id": "MPL", "age": 1},  # age updated
+            {"tree_id": 20251103002, "species_id": "OAK", "age": 99},  # age updated
+            # 20241103003 deleted
+            {"tree_id": 20251103004, "species_id": "SPC", "age": 29},  # inserted
+            {"tree_id": 20251103005, "species_id": "BCH", "age": 46},  # inserted
+        ]
+    }
+
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Birch'
+            )
+            """
+        )
+        conn_a.execute(
+            """
+            INSERT INTO trees (tree_id, species_id, age) VALUES (
+                20251103005, 'BCH', 46
+            )
+            """
+        )
+        conn_a.execute(
+            """
+            DELETE FROM trees WHERE tree_id IS 20251103003
+            """
+        )
+        conn_a.execute(
+            """
+            DELETE FROM species WHERE species_id IS 'PIN'
+            """
+        )
+        conn_a.execute(
+            """
+            UPDATE trees SET age=1 WHERE tree_id=20251103001
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'SPC', 'Spruce'
+            )
+            """
+        )
+        conn_b.execute(
+            """
+            INSERT INTO trees (tree_id, species_id, age) VALUES (
+                20251103004, 'SPC', 29
+            )
+            """
+        )
+        conn_b.execute(
+            """
+            UPDATE trees SET age=99 WHERE tree_id=20251103002
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
-        older, newer = user_a, user_b
+        theirs, mine = user_a, user_b
     else:
-        older, newer = user_b, user_a
+        theirs, mine = user_b, user_a
 
-    # The expected data following a successful rebase
-    expected = [
-        ("Maple", 25, "original_001"),
-        ("Oak", 30, "user_x_001"),  # user_id changed by both users to same value
-        ("Pine", 18, "original_003"),
-    ]
+    # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Act & Assert
-    geodiff.rebase(str(original), str(older), str(newer), str(conflict))
-    # The rebased gpkg should contain all changes and no conflict file should be created
-    assert_gpkg(newer, expected)
+    # Assert that rebased database contains expected changes and no conflict exists
+    assert_data_as_expected(mine, expected)
     assert not conflict.exists()
 
 
-@pytest.mark.parametrize(
-    "create_table_ddl",
-    [
-        pytest.param(CREATE_TABLE.replace(" UNIQUE", ""), id="no_constraint"),
-        pytest.param(CREATE_TABLE, id="unique_constraint"),
-    ],
-)
-@pytest.mark.parametrize(
-    "user_a_data_first",
-    [True, False],
-    ids=["user_a_data_first", "user_b_data_first"]
-)
-def test_geodiff_rebase_resolved_conflict_update(create_table_ddl, user_a_data_first, tmp_path):
-    """
-    This test for an expected resolved conflict. Both user_a and user_b update the
-    same column with different values. pygeodiff rebases using the newer value
-    and records the resolved conflict in the conflict file.
+"""
+The next tests cover scenarios with conflicting changes or where changes result
+in constraint violations.
+"""
 
-    This should be unnaffected by any changes made to resolve issue 210.
+
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_conflicting_edits(user_a_data_first, tmp_path):
+    """
+    This test checks that rebase handles conflicting edits to the same row and
+    column.
     """
     # Arrange
     geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
     conflict = tmp_path / "conflict.txt"
-    original, user_a, user_b = create_gpkg_files(create_table_ddl, tmp_path)
-    # Update a common value  in each user data table
-    with sqlite3.connect(user_a) as conn_a, sqlite3.connect(user_b) as conn_b:
-        conn_a.execute("UPDATE trees SET age = 25 WHERE user_id = 'original_002'")
-        conn_b.execute("UPDATE trees SET age = 35 WHERE user_id = 'original_002'")
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
 
-    # Set the argument order, i.e. which gpkg should be the rebased result,
-    # and the values expected to be found in the conflict file
+    # Apply changes to databases (both users edit same value)
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            UPDATE species SET name='Maple_A' WHERE species_id='MPL'
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            UPDATE species SET name='Maple_B' WHERE species_id='MPL'
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
-        older, newer = user_a, user_b
-        old_age, new_age = 25, 35
+        theirs, mine = user_a, user_b
+        # user_a changes went in first then were overwritten by user_b changes.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple_B"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+            ]
+        }
     else:
-        older, newer = user_b, user_a
-        old_age, new_age = 35, 25
+        theirs, mine = user_b, user_a
+        # user_b changes went in first then were overwritten by user_a changes.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple_A"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+            ]
+        }
 
-    # A resolved conflict implies the newer value will be used
-    # and so the result will be the same as the original
-    with sqlite3.connect(newer) as conn:
-        cursor = conn.cursor()
-        expected = cursor.execute("SELECT species, age, user_id FROM trees").fetchall()
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Act & Assert
-    geodiff.rebase(str(original), str(older), str(newer), str(conflict))
-    assert_gpkg(newer, expected)
-    # A conflict has been resolved with the newer value, new_age, being used
+    # Assert that rebased database contains expected changes and conflict is recorded
+    assert_data_as_expected(mine, expected)
     assert conflict.exists()
     conflict_json = json.loads(conflict.read_text())
     assert conflict_json['geodiff'][0]['type'] == 'conflict'
-    assert conflict_json['geodiff'][0]['changes'][0]['new'] == new_age
-    assert conflict_json['geodiff'][0]['changes'][0]['old'] == old_age
+    assert conflict_json['geodiff'][0]['table'] == 'species'
 
 
-def create_gpkg_files(create_table_ddl: str, tmp_path: Path) -> Tuple[Path, Path, Path]:
+@pytest.mark.xfail(
+        raises=GeoDiffLibError,
+        reason=("Expected to fail due to issue 210. Unique constraint violation handling"
+                " not yet implemented")
+)
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_unique_constraint_violation(user_a_data_first, tmp_path):
     """
-    Create 3 GeoPackage files at the given filepaths, create the
-    same table with the same original data in each of them.
+    This test covers a rebase where combining edits causes a unique constraint
+    violation.
     """
-    original = tmp_path / "original.gpkg"
-    user_a = tmp_path / "user_a.gpkg"
-    user_b = tmp_path / "user_b.gpkg"
-    for gpkg in [original, user_a, user_b]:
-        with sqlite3.connect(gpkg) as conn:
-            # Add an empty table and then populate with initial data
-            conn.execute(create_table_ddl)
-            conn.executemany(
-                """
-                INSERT INTO trees (species, age, user_id)
-                VALUES (?, ?, ?)
-                """,
-                (list(row.values()) for row in ORIGINAL_DATA)
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
+
+    # Apply changes to databases (both users create the same species_id)
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Birch'
             )
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Beech'
+            )
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+        # user_a changes are preserved, because they went in first.
+        # user_b changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+                {"species_id": "BCH", "name": "Birch"},
+            ]
+        }
+    else:
+        theirs, mine = user_b, user_a
+        # user_b changes are preserved, because they went in first.
+        # user_a changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+                {"species_id": "BCH", "name": "Beech"},
+            ]
+        }
+
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes and conflict is recorded
+
+    # TODO: What is the correct behaviour here?  The assertions below are for
+    # the case where geodiff brings in all possible rows without raising an error
+    # and creates a conflict file containing any rows that failed.  The conflict file
+    # should report a UNIQUE constraint violation.
+    assert_data_as_expected(mine, expected)
+    assert conflict.exists()
+    conflict_json = json.loads(conflict.read_text())
+    assert conflict_json['geodiff'][0]['type'] == 'unique_constraint_violation'
+    assert conflict_json['geodiff'][0]['table'] == 'species'
+
+
+@pytest.mark.xfail(
+        reason=("Expected to fail due to issue 210. Foreign key constraint violation handling"
+                " not yet implemented.  geodiff will make changes that violate constraint."
+                " Foreign Key enforcement must be explicitly activated for SQLite.")
+)
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_fkey_constraint_violation(user_a_data_first, tmp_path):
+    """
+    This test covers a rebase where combining edits causes a foreign key constraint
+    violation.
+
+    Note: SQLite only enforces Foreign Key constraints when 'PRAGMA foreign_keys = ON'
+    has been applied.
+    """
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
+
+    # Apply changes to databases (user_a deletes species_id for tree inserted by user_b)
+    with sqlite3.connect(user_a) as conn_a:
+        # Delete pine trees and parent pine species
+        conn_a.execute(
+            """
+            DELETE FROM trees WHERE species_id IS 'PIN'
+            """
+        )
+        conn_a.execute(
+            """
+            DELETE FROM species WHERE species_id IS 'PIN'
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        # Add a pine tree
+        conn_b.execute(
+            """
+            INSERT INTO trees (tree_id, species_id, age) VALUES (
+                20251103004, 'PIN', 101
+            )
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+        # user_a changes are preserved, because they went in first.
+        # user_b changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                # 'PIN' deleted
+            ],
+            "trees": [
+                {"tree_id": 20251103001, "species_id": "MPL", "age": 25},
+                {"tree_id": 20251103002, "species_id": "OAK", "age": 30},
+                # 20241103003 deleted
+            ]
+        }
+    else:
+        theirs, mine = user_b, user_a
+        # user_b changes are preserved, because they went in first.
+        # user_a changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"}
+            ],
+            "trees": [
+                {"tree_id": 20251103001, "species_id": "MPL", "age": 25},
+                {"tree_id": 20251103002, "species_id": "OAK", "age": 30},
+                {"tree_id": 20251103003, "species_id": "PIN", "age": 18},
+                {"tree_id": 20251103004, "species_id": "PIN", "age": 101},
+            ]
+        }
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes and conflict is recorded
+
+    # TODO: What is the correct behaviour here?  The assertions below are for
+    # the case where geodiff brings in all possible rows that don't raise an error
+    # and creates a conflict file containing any rows that failed.  The conflict
+    # file should report a FOREIGN KEY constraint violation.
+    assert_data_as_expected(mine, expected)
+    assert conflict.exists()
+    conflict_json = json.loads(conflict.read_text())
+    assert conflict_json['geodiff'][0]['type'] == 'foreign_key_constraint_violation'
+    assert conflict_json['geodiff'][0]['table'] == 'species'
+
+
+"""
+Helper functions are defined below here.
+"""
+
+
+def assert_data_as_expected(db: Path, expected_data: dict[str, list[dict]]):
+    """
+    Assert that table contents are as expected.  Use `set` comparison because
+    the row ordering depends on the order that tables are passed to `rebase`.
+    """
+    with sqlite3.connect(db) as conn:
+        for table, rows in expected_data.items():
+            column_names = rows[0].keys()
+            results = conn.execute(
+                f"""SELECT {", ".join(column_names)} FROM {table}"""
+                ).fetchall()
+
+            assert set(results) == set(tuple(row.values()) for row in rows)
+
+
+def create_db_files(tmp_path: Path, db_constrained: bool = True) -> Tuple[Path, Path, Path]:
+    """
+    Create 3 SQLite files at the given filepaths, each with the same tables
+    and data.
+
+    If `db_constrained`, the database will apply UNIQUE and FOREIGN
+    KEY constraints.
+    """
+    original = tmp_path / "original.db"
+    user_a = tmp_path / "user_a.db"
+    user_b = tmp_path / "user_b.db"
+
+    # Define tables
+    create_species_sql = """
+        CREATE TABLE species (
+            fid INTEGER PRIMARY KEY,
+            species_id TEXT UNIQUE,
+            name TEXT
+        )"""
+    create_trees_sql = """
+        CREATE TABLE trees (
+            fid INTEGER PRIMARY KEY,
+            tree_id INTEGER UNIQUE NOT NULL,
+            species_id TEXT NOT NULL,
+            age INTEGER,
+            FOREIGN KEY("species_id") REFERENCES "species"("species_id")
+        )"""
+
+    if not db_constrained:
+        # Remove database constraints from table definitions
+        create_species_sql = re.sub(r" UNIQUE", "", create_species_sql)
+        create_trees_sql = re.sub(r" UNIQUE", "", create_trees_sql)
+        create_trees_sql = re.sub(r",.*FOREIGN.*REFERENCES.*\)", "", create_trees_sql)
+
+    # Define initial data
+    species_data = [
+            {"species_id": "MPL", "name": "Maple"},
+            {"species_id": "OAK", "name": "Oak"},
+            {"species_id": "PIN", "name": "Pine"},
+        ]
+    trees_data = [
+            {"tree_id": 20251103001, "species_id": "MPL", "age": 25},
+            {"tree_id": 20251103002, "species_id": "OAK", "age": 30},
+            {"tree_id": 20251103003, "species_id": "PIN", "age": 18},
+        ]
+
+    # Create geopackages
+    with sqlite3.connect(original) as conn:
+        conn.execute(create_species_sql)
+        conn.execute(create_trees_sql)
+        conn.executemany(
+            """
+            INSERT INTO species (species_id, name)
+            VALUES (:species_id, :name)
+            """,
+            species_data
+        )
+        conn.executemany(
+            """
+            INSERT INTO trees (tree_id, species_id, age)
+            VALUES (:tree_id, :species_id, :age)
+            """,
+            trees_data
+        )
+
+    user_a.write_bytes(original.read_bytes())
+    user_b.write_bytes(original.read_bytes())
 
     return original, user_a, user_b
-
-
-def assert_gpkg(gpkg: Path, expected: List[tuple]):
-    """
-    Assert that the data (excluding fid) in the gpkg is the
-    expected data, regardless of row order.
-    """
-    with sqlite3.connect(gpkg) as conn:
-        cursor = conn.cursor()
-        result = cursor.execute("SELECT species, age, user_id FROM trees").fetchall()
-        assert set(result) == set(expected)
