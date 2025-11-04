@@ -28,6 +28,13 @@ from pygeodiff import GeoDiffLibError
 
 GEODIFFLIB = os.environ.get("GEODIFFLIB", None)
 
+"""
+These tests cover simple rebase scenarios, with or without database constraints
+applied.
+
+All should pass once issue 210 has been resolved.
+"""
+
 
 @pytest.mark.parametrize(
     "db_constrained",
@@ -46,10 +53,10 @@ GEODIFFLIB = os.environ.get("GEODIFFLIB", None)
 @pytest.mark.parametrize(
     "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
 )
-def test_geodiff_rebase_unique_happy_path(db_constrained, user_a_data_first, tmp_path):
+def test_geodiff_rebase_happy_path_single_table(db_constrained, user_a_data_first, tmp_path):
     """
-    This test checks that rebase succeeds on simple changes to a table with
-    unique constraints.  This test applies INSERT, UPDATE and DELETE
+    This test checks that rebase succeeds on changes to a single table with
+    or without unique constraints.  This test applies INSERT, UPDATE and DELETE
     changes that should not produce any conflicts.
     """
     # Arrange
@@ -131,10 +138,10 @@ def test_geodiff_rebase_unique_happy_path(db_constrained, user_a_data_first, tmp
 @pytest.mark.parametrize(
     "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
 )
-def test_geodiff_rebase_fk_happy_path(db_constrained, user_a_data_first, tmp_path):
+def test_geodiff_rebase_happy_path_fk_tables(db_constrained, user_a_data_first, tmp_path):
     """
-    This test checks that rebase succeeds on simple changes on tables with
-    foreign key constraints.  This test applies INSERT, UPDATE and DELETE
+    This test checks that rebase succeeds on changes on multiple tables related
+    by a foreign key constraint.  This test applies INSERT, UPDATE and DELETE
     changes that should not produce any conflicts.
     """
     # Arrange
@@ -223,6 +230,11 @@ def test_geodiff_rebase_fk_happy_path(db_constrained, user_a_data_first, tmp_pat
 
     # Assert that rebased database contains expected changes
     assert_data_as_expected(mine, expected)
+
+
+"""
+Helper functions are defined below here.
+"""
 
 
 def assert_data_as_expected(db: Path, expected_data: dict[str, list[dict]]):
