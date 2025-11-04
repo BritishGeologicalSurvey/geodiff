@@ -15,6 +15,7 @@ a GeoDiffConstraintError that reports the error message from the database with
 information about the constraint that was broken.
 """
 
+import json
 import os
 from pathlib import Path
 import re
@@ -108,7 +109,7 @@ def test_geodiff_rebase_happy_path_single_table(db_constrained, user_a_data_firs
             """
         )
 
-    # Set the argument order, i.e. which db should be the rebased result
+    # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
         theirs, mine = user_a, user_b
     else:
@@ -117,8 +118,9 @@ def test_geodiff_rebase_happy_path_single_table(db_constrained, user_a_data_firs
     # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
     geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Assert that rebased database contains expected changes
+    # Assert that rebased database contains expected changes and no conflict exists
     assert_data_as_expected(mine, expected)
+    assert not conflict.exists()
 
 
 @pytest.mark.parametrize(
@@ -219,7 +221,7 @@ def test_geodiff_rebase_happy_path_fk_tables(db_constrained, user_a_data_first, 
             """
         )
 
-    # Set the argument order, i.e. which db should be the rebased result
+    # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
         theirs, mine = user_a, user_b
     else:
@@ -228,8 +230,74 @@ def test_geodiff_rebase_happy_path_fk_tables(db_constrained, user_a_data_first, 
     # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
     geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
 
-    # Assert that rebased database contains expected changes
+    # Assert that rebased database contains expected changes and no conflict exists
     assert_data_as_expected(mine, expected)
+    assert not conflict.exists()
+
+
+"""
+The next tests cover scenarios with conflicting changes or where changes result
+in constraint violations.
+"""
+
+
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_conflicting_edits(user_a_data_first, tmp_path):
+    """
+    This test checks that rebase handles conflicting edits to the same row and
+    column.
+    """
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
+
+    # Apply changes to databases (both users edit same value)
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            UPDATE species SET name='Maple_A' WHERE species_id='MPL'
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            UPDATE species SET name='Maple_B' WHERE species_id='MPL'
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple_B"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+            ]
+        }
+    else:
+        theirs, mine = user_b, user_a
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple_A"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+            ]
+        }
+
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes and conflict is recorded
+    assert_data_as_expected(mine, expected)
+    assert conflict.exists()
+    conflict_json = json.loads(conflict.read_text())
+    assert conflict_json['geodiff'][0]['type'] == 'conflict'
+    assert conflict_json['geodiff'][0]['table'] == 'species'
 
 
 """
