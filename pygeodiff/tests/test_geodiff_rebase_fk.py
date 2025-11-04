@@ -272,6 +272,7 @@ def test_geodiff_rebase_conflicting_edits(user_a_data_first, tmp_path):
     # Set the argument order. Rebased db has "their" changes before "mine".
     if user_a_data_first:
         theirs, mine = user_a, user_b
+        # user_a changes went in first then were overwritten by user_b changes.
         expected = {
             "species": [
                 {"species_id": "MPL", "name": "Maple_B"},
@@ -281,6 +282,7 @@ def test_geodiff_rebase_conflicting_edits(user_a_data_first, tmp_path):
         }
     else:
         theirs, mine = user_b, user_a
+        # user_b changes went in first then were overwritten by user_a changes.
         expected = {
             "species": [
                 {"species_id": "MPL", "name": "Maple_A"},
@@ -297,6 +299,180 @@ def test_geodiff_rebase_conflicting_edits(user_a_data_first, tmp_path):
     assert conflict.exists()
     conflict_json = json.loads(conflict.read_text())
     assert conflict_json['geodiff'][0]['type'] == 'conflict'
+    assert conflict_json['geodiff'][0]['table'] == 'species'
+
+
+@pytest.mark.xfail(
+        raises=GeoDiffLibError,
+        reason=("Expected to fail due to issue 210. Unique constraint violation handling"
+                " not yet implemented")
+)
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_unique_constraint_violation(user_a_data_first, tmp_path):
+    """
+    This test covers a rebase where combining edits causes a unique constraint
+    violation.
+    """
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
+
+    # Apply changes to databases (both users create the same species_id)
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Birch'
+            )
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Beech'
+            )
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+        # user_a changes are preserved, because they went in first.
+        # user_b changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+                {"species_id": "BCH", "name": "Birch"},
+            ]
+        }
+    else:
+        theirs, mine = user_b, user_a
+        # user_b changes are preserved, because they went in first.
+        # user_a changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"},
+                {"species_id": "BCH", "name": "Beech"},
+            ]
+        }
+
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes and conflict is recorded
+
+    # TODO: What is the correct behaviour here?  The assertions below are for
+    # the case where geodiff brings in all possible rows without raising an error
+    # and creates a conflict file containing any rows that failed.  The conflict file
+    # should report a UNIQUE constraint violation.
+    assert_data_as_expected(mine, expected)
+    assert conflict.exists()
+    conflict_json = json.loads(conflict.read_text())
+    assert conflict_json['geodiff'][0]['type'] == 'unique_constraint_violation'
+    assert conflict_json['geodiff'][0]['table'] == 'species'
+
+
+@pytest.mark.xfail(
+        reason=("Expected to fail due to issue 210. Foreign key constraint violation handling"
+                " not yet implemented.  geodiff will make changes that violate constraint."
+                " Foreign Key enforcement must be explicitly activated for SQLite.")
+)
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_fkey_constraint_violation(user_a_data_first, tmp_path):
+    """
+    This test covers a rebase where combining edits causes a foreign key constraint
+    violation.
+
+    Note: SQLite only enforces Foreign Key constraints when 'PRAGMA foreign_keys = ON'
+    has been applied.
+    """
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=True)
+
+    # Apply changes to databases (user_a deletes species_id for tree inserted by user_b)
+    with sqlite3.connect(user_a) as conn_a:
+        # Delete pine trees and parent pine species
+        conn_a.execute(
+            """
+            DELETE FROM trees WHERE species_id IS 'PIN'
+            """
+        )
+        conn_a.execute(
+            """
+            DELETE FROM species WHERE species_id IS 'PIN'
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        # Add a pine tree
+        conn_b.execute(
+            """
+            INSERT INTO trees (tree_id, species_id, age) VALUES (
+                20251103004, 'PIN', 101
+            )
+            """
+        )
+
+    # Set the argument order. Rebased db has "their" changes before "mine".
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+        # user_a changes are preserved, because they went in first.
+        # user_b changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                # 'PIN' deleted
+            ],
+            "trees": [
+                {"tree_id": 20251103001, "species_id": "MPL", "age": 25},
+                {"tree_id": 20251103002, "species_id": "OAK", "age": 30},
+                # 20241103003 deleted
+            ]
+        }
+    else:
+        theirs, mine = user_b, user_a
+        # user_b changes are preserved, because they went in first.
+        # user_a changes violate constraint.
+        expected = {
+            "species": [
+                {"species_id": "MPL", "name": "Maple"},
+                {"species_id": "OAK", "name": "Oak"},
+                {"species_id": "PIN", "name": "Pine"}
+            ],
+            "trees": [
+                {"tree_id": 20251103001, "species_id": "MPL", "age": 25},
+                {"tree_id": 20251103002, "species_id": "OAK", "age": 30},
+                {"tree_id": 20251103003, "species_id": "PIN", "age": 18},
+                {"tree_id": 20251103004, "species_id": "PIN", "age": 101},
+            ]
+        }
+    # Act
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes and conflict is recorded
+
+    # TODO: What is the correct behaviour here?  The assertions below are for
+    # the case where geodiff brings in all possible rows that don't raise an error
+    # and creates a conflict file containing any rows that failed.  The conflict
+    # file should report a FOREIGN KEY constraint violation.
+    assert_data_as_expected(mine, expected)
+    assert conflict.exists()
+    conflict_json = json.loads(conflict.read_text())
+    assert conflict_json['geodiff'][0]['type'] == 'foreign_key_constraint_violation'
     assert conflict_json['geodiff'][0]['table'] == 'species'
 
 
