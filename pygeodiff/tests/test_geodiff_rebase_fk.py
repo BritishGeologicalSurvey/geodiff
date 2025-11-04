@@ -2,6 +2,10 @@
 This file tests the behaviour of geodiff when there are database-level constraints
 applied to the tables.
 
+Where tests are parametrised with `db_constrained`, the same test is run with and
+without the db constraints.  Tests against unconstrained databases act as
+regression tests for existing geodiff behaviour.
+
 Some of the tests are expected to fail until issue 210 has been resolved.
 https://github.com/MerginMaps/geodiff/issues/210
 
@@ -23,6 +27,91 @@ import pygeodiff
 from pygeodiff import GeoDiffLibError
 
 GEODIFFLIB = os.environ.get("GEODIFFLIB", None)
+
+
+@pytest.mark.parametrize(
+    "db_constrained",
+    [
+        pytest.param(False, id="no_db_constraint"),
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                raises=GeoDiffLibError,
+                reason="Expected to fail due to issue 210, when this xpasses remove this decorator",
+            ),
+            id="dbconstraint",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "user_a_data_first", [True, False], ids=["user_a_data_first", "user_b_data_first"]
+)
+def test_geodiff_rebase_unique_happy_path(db_constrained, user_a_data_first, tmp_path):
+    """
+    This test checks that rebase succeeds on simple changes to a table with
+    unique constraints.  This test applies INSERT, UPDATE and DELETE
+    changes that should not produce any conflicts.
+    """
+    # Arrange
+    geodiff = pygeodiff.GeoDiff(GEODIFFLIB)
+    conflict = tmp_path / "conflict.txt"
+    original, user_a, user_b = create_db_files(tmp_path, db_constrained=db_constrained)
+
+    # Apply changes to databases to give the following expected values
+    expected = {
+        "species": [
+            {"species_id": "MPL", "name": "Maple_updated"},  # updated
+            {"species_id": "OAK", "name": "Oak_updated"},  # updated
+            # 'PIN' deleted
+            {"species_id": "SPC", "name": "Spruce"},  # inserted
+            {"species_id": "BCH", "name": "Birch"},  # inserted
+        ],
+    }
+
+    with sqlite3.connect(user_a) as conn_a:
+        conn_a.execute(
+            """
+            UPDATE species SET name='Maple_updated' WHERE species_id='MPL'
+            """
+        )
+        conn_a.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'BCH', 'Birch'
+            )
+            """
+        )
+
+    with sqlite3.connect(user_b) as conn_b:
+        conn_b.execute(
+            """
+            UPDATE species SET name='Oak_updated' WHERE species_id='OAK'
+            """
+        )
+        conn_b.execute(
+            """
+            INSERT INTO species (species_id, name) VALUES (
+                'SPC', 'Spruce'
+            )
+            """
+        )
+        conn_b.execute(
+            """
+            DELETE FROM species WHERE species_id IS 'PIN'
+            """
+        )
+
+    # Set the argument order, i.e. which db should be the rebased result
+    if user_a_data_first:
+        theirs, mine = user_a, user_b
+    else:
+        theirs, mine = user_b, user_a
+
+    # Act (this will raise a GeoDiffLibError if geodiff cannot handle foreign keys)
+    geodiff.rebase(str(original), str(theirs), str(mine), str(conflict))
+
+    # Assert that rebased database contains expected changes
+    assert_data_as_expected(mine, expected)
 
 
 @pytest.mark.parametrize(
