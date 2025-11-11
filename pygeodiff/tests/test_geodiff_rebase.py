@@ -1,24 +1,28 @@
+# -*- coding: utf-8 -*-
 """
-This module tests the behaviour of geodiff when there are database-level constraints
-applied to the tables.
-
-Where tests are parametrised with `db_constrained`, the same test is run with and
-without the db constraints.  Tests against unconstrained databases act as
-regression tests for existing geodiff behaviour.  Tests are parametrised with
-`user_a_data_first` to show where rebase outcome depends on the order that
-database files are passed to the rebase function.
-
-Some of the tests are expected to fail until issue 210 has been resolved.
-https://github.com/MerginMaps/geodiff/issues/210
-
-Once database constraint handling has been implemented, the tests will pass and
-the `xfail` decorators can be removed.
-
-The behaviour of GeoDiff in scenarios where combining changes from two users will
-cause a database constraint to fail is as-yet undefined.  Perhaps it should raise
-a GeoDiffConstraintError that reports the error message from the database with
-information about the constraint that was broken.
+    :copyright: (c) 2025 Colin Blackburn, Leo Rudczenko, John Stevenson (British Geological Survey)
+    :license: MIT, see LICENSE for more details.
 """
+
+# This module tests the behaviour of geodiff when there are database-level constraints
+# applied to the tables.
+
+# Where tests are parametrised with `db_constrained`, the same test is run with and
+# without the db constraints.  Tests against unconstrained databases act as
+# regression tests for existing geodiff behaviour.  Tests are parametrised with
+# `user_a_data_first` to show where rebase outcome depends on the order that
+# database files are passed to the rebase function.
+
+# Some of the tests are expected to fail until issue 210 has been resolved.
+# https://github.com/MerginMaps/geodiff/issues/210
+
+# Once database constraint handling has been implemented, the tests will pass and
+# the `xfail` decorators can be removed.
+
+# The behaviour of GeoDiff in scenarios where combining changes from two users will
+# cause a database constraint to fail is as-yet undefined.  Perhaps it should raise
+# a GeoDiffConstraintError that reports the error message from the database with
+# information about the constraint that was broken.
 
 import json
 import os
